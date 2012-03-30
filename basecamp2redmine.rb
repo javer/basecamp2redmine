@@ -30,6 +30,12 @@
 # CHANGELOG
 # 2010-08-23 Initial public release
 # 2010-11-21 Applied bugfix to properly escape quotes
+# 2012-03-31 Preserve authors and assigns for tasks, posts, comments and calendar events by using custom BasecampUserId=>RedmineUserId hash
+#            Preserve tasks status (new, assigned, closed), start date, due date, updated on, done ratio
+#            Added support for tasks discussions
+#            Added support for Calendar Events (requires Redmine Meetings Plugin)
+#            Fixed compatibility with latest Basecamp export xml format
+#            All tasks are imported to default Task tracker
 #
 # Thanks to Tactio Interaction Design (www.tactio.com.br) for funding this work!
 #
@@ -58,10 +64,16 @@ PROJECT_NAME_LENGTH = 30
 BOARD_DESCRIPTION_LENGTH = 255
 MESSAGE_SUBJECT_LENGTH = 255
 ISSUE_SUBJECT_LENGTH = 255
+MEETING_SUBJECT_LENGTH = 255
 
 ELLIPSIS = '...'
-TRACKER = 'Basecamp Todo'
+TRACKER = 'Task'
 NAME_APPEND = ' (BC)'
+
+users_map = {
+  # Here you should specify correspondence between Basecamp UserID and Redmine UserID
+  #"8993323" => 19
+}
 
 filename = ARGV[0] or raise ArgumentError, "Must have filename specified on command line"
 
@@ -121,11 +133,13 @@ src << %{todos = {}}
 src << %{journals = {}}
 src << %{messages = {}}
 src << %{comments = {}}
+src << %{meetings = {}}
 
 src << %{BASECAMP_TRACKER = Tracker.find_by_name '#{TRACKER}'}
 src << %{raise "Tracker named '#{TRACKER}' must exist" unless BASECAMP_TRACKER}
 
 src << %{DEFAULT_STATUS = IssueStatus.default}
+src << %{ASSIGNED_STATUS = IssueStatus.find_by_position(2)}
 src << %{CLOSED_STATUS = IssueStatus.find :first, :conditions => { :is_closed => true }}
 src << %{AUTHOR = User.anonymous  #User.find 1}
 
@@ -156,7 +170,7 @@ x.xpath('//todo-list').each do |todo_list|
   id = (todo_list % 'id').content
   description = (todo_list % 'description').content
   parent_project_id = (todo_list % 'project-id').content
-  complete = (todo_list % 'complete').content == 'true'
+  complete = (todo_list % 'uncompleted-count').content == '0'
   
 # Commented because we don't want Todo Lists created as Sub-Projects.  Using Sub-Tasks instead.
 #  src << %{print "About to create todo-list #{id} ('#{short_name}') as sub-project of #{parent_project_id}..."}
@@ -190,17 +204,31 @@ x.xpath('//todo-item').each do |todo_item|
   complete = (todo_item % 'completed').content == 'true'
   created_at = (todo_item % 'created-at').content
   #completed_at = (todo_item % 'completed-at').content rescue nil
+  due_date = (todo_item % 'due-at').content rescue nil
+  assigned_to_id = users_map[(todo_item % 'responsible-party-id').content] rescue 'AUTHOR.id'
+  author_id = users_map[(todo_item % 'creator-id').content] rescue 'AUTHOR.id'
+  updated_on = (todo_item % 'updated-at').content rescue nil
+  start_date = (todo_item % 'created-at').content
+  done_ratio = complete ? 100 : 0
+  due_date = start_date if !start_date.empty? && !due_date.empty? && (due_date < start_date)
+  status = complete ? 'CLOSED_STATUS' : (!author_id.nil? ? 'ASSIGNED_STATUS' : 'DEFAULT_STATUS')
   
   src << %{print "About to create todo #{id} as Redmine sub-issue under issue #{parent_todo_list_id}."}
   src << %{    todos['#{id}'] = Issue.new :subject => %{#{short_content}}, :description => %{#{content}},
                 :created_on => '#{created_at}' }
                 #:completed_at => '#{completed_at}'
   #i.category = IssueCategory.find_by_project_id_and_name(i.project_id, bug.category[0,30]) unless bug.category.blank?
-  src << %{    todos['#{id}'].status = #{complete} ? CLOSED_STATUS : DEFAULT_STATUS}
+  src << %{    todos['#{id}'].status = #{status}}
   src << %{    todos['#{id}'].tracker = BASECAMP_TRACKER}
-  src << %{    todos['#{id}'].author = AUTHOR}
+  #src << %{    todos['#{id}'].author = AUTHOR}
   src << %{    todos['#{id}'].project = todo_lists['#{parent_todo_list_id}'].project}
   src << %{    todos['#{id}'].parent_issue_id = todo_lists['#{parent_todo_list_id}'].id}
+  src << %{    todos['#{id}'].due_date = '#{due_date}'} unless due_date.empty?
+  src << %{    todos['#{id}'].assigned_to_id = #{assigned_to_id}}
+  src << %{    todos['#{id}'].author_id = #{author_id}}
+  src << %{    todos['#{id}'].updated_on = '#{updated_on}'} unless updated_on.empty?
+  src << %{    todos['#{id}'].start_date = '#{start_date}'}
+  src << %{    todos['#{id}'].done_ratio = #{done_ratio}}
   src << %{    todos['#{id}'].save!}
   src << %{puts " Saved as Issue ID " + todos['#{id}'].id.to_s}
 end
@@ -219,13 +247,16 @@ x.xpath('//post').each do |post|
   parent_project_id = (post % 'project-id').content
   author_name = (post % 'author-name').content
   posted_on = (post % 'posted-on').content
+  updated_on = (post % 'commented-at').content rescue nil
+  author_id = users_map[(post % 'author-id').content] rescue 'AUTHOR.id'
   
   src << %{print "About to create post #{id} as Redmine message under project #{parent_project_id}."}
   src << %{    messages['#{id}'] = Message.new :board => projects['#{parent_project_id}'].boards.first,
-                :subject => %{#{short_title}}, :content => %{#{body}\\n\\n-- \\n#{author_name}},
-                :created_on => '#{posted_on}', :author => AUTHOR }
+                :subject => %{#{short_title}}, :content => %{#{body}},
+                :created_on => '#{posted_on}', :author_id => #{author_id} }
                 #:completed_at => '#{completed_at}'
   #src << %{    messages['#{id}'].author = AUTHOR}
+  src << %{    messages['#{id}'].updated_on = '#{updated_on}'} unless updated_on.empty?
   src << %{    messages['#{id}'].save!}
   src << %{puts " Saved as Message ID " + messages['#{id}'].id.to_s}
   
@@ -240,14 +271,57 @@ x.xpath('//post').each do |post|
     parent_message_id = (comment % 'commentable-id').content
     comment_author_name = (comment % 'author-name').content
     comment_created_at = (comment % 'created-at').content
+    author_id = users_map[(comment % 'author-id').content] rescue 'AUTHOR.id'
     
     src << %{print "About to create post comment #{comment_id} as Redmine sub-message under project #{parent_project_id}."}
     src << %{    comments['#{comment_id}'] = Message.new :board => projects['#{parent_project_id}'].boards.first,
-                  :subject => %{#{message_reply_prefix}#{short_title}}, :content => %{#{comment_body}\\n\\n-- \\n#{comment_author_name}},
-                  :created_on => '#{comment_created_at}', :author => AUTHOR, :parent => messages['#{id}'] }
+                  :subject => %{#{message_reply_prefix}#{short_title}}, :content => %{#{comment_body}},
+                  :created_on => '#{comment_created_at}', :author_id => #{author_id}, :parent => messages['#{id}'] }
     src << %{    comments['#{comment_id}'].save!}
     src << %{puts " Saved comment as Message ID " + comments['#{comment_id}'].id.to_s}
   end
+end
+
+x.xpath('.//comment[commentable-type = "TodoItem"]').each do |comment|
+  # Convert some HTML tags
+  body = (comment % 'body').content.gsub(/&lt;/, '<').gsub(/&gt;/, '>').gsub(/&amp;/, '&')
+  body.gsub!(/<div[^>]*>/, '')
+  body.gsub!(/<\/div>/, "\n")
+  body.gsub!(/<br ?\/?>/, "\n")
+  
+  id = (comment % 'id').content
+  author_id = users_map[(comment % 'author-id').content] rescue 'AUTHOR.id'
+  commentable_id = (comment % 'commentable-id').content
+  created_at = (comment % 'created-at').content
+  
+  src << %{print "About to create journal #{id} as Redmine journal for issue #{commentable_id}..."}
+  src << %{    journals['#{id}'] = Journal.new :journalized_id => todos['#{commentable_id}'].id,
+                :journalized_type => 'Issue', :notes => %{#{body}},
+                :created_on => '#{created_at}', :user_id => #{author_id} }
+  src << %{    journals['#{id}'].save!}
+  src << %{puts " Saved as Journal ID " + journals['#{id}'].id.to_s}
+end
+
+x.xpath('//calendar-event').each do |event|
+  id = (event % 'id').content
+  title = (event % 'title').content
+  short_title = MyString.new(title).center_truncate(MEETING_SUBJECT_LENGTH, ELLIPSIS)
+  parent_project_id = (event % 'project-id').content
+  author_id = users_map[(event % 'creator-id').content] rescue 'AUTHOR.id'
+  created_at = (event % 'created-on').content
+  start_date = (event % 'start-at').content rescue nil
+  due_date = (event % 'due-at').content rescue nil
+  start_date = due_date if start_date.empty?
+  
+  src << %{print "About to create event #{id} as Redmine meeting under project #{parent_project_id}..."}
+  src << %{    meetings['#{id}'] = Meeting.new :subject => %{#{short_title}}, :location => %{},
+                :created_on => '#{created_at}', :updated_on => '#{created_at}' }
+  src << %{    meetings['#{id}'].project = projects['#{parent_project_id}']}
+  src << %{    meetings['#{id}'].author_id = #{author_id}}
+  src << %{    meetings['#{id}'].start_date = DateTime.parse('#{start_date}')} unless start_date.empty?
+  src << %{    meetings['#{id}'].end_date = DateTime.parse('#{due_date}')} unless due_date.empty?
+  src << %{    meetings['#{id}'].save!}
+  src << %{puts " Saved as Meeting ID " + meetings['#{id}'].id.to_s}
 end
 
   src << %{puts "\\n\\n-----------\\nUndo Script\\n-----------\\nTo undo this import, run script/console and paste in this Ruby code.  This will delete only the projects created by the import process.\\n\\n"}
